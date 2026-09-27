@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Read-only Herdr pane TCP detector. Python standard library, Linux only."""
+import socket
+import sys
+import json
+import os
+from pathlib import Path
+import stat
+import struct
+import time
+import hashlib
+import re
+import unicodedata
+
+MAX_API_BYTES = 1024 * 1024
+MAX_FRAME_BYTES = 65536
+MAX_SERVICES = 128
+
+
+class DetectorError(Exception):
+    """Fail closed: never translate discovery failure into an empty snapshot."""
+
+
+def remaining(deadline):
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise DetectorError('discovery deadline exceeded')
+    return value
+
+
+class HerdrClient:
+    def __init__(self, path, deadline=None):
+        self.path = str(path)
+        self.deadline = deadline
+
+    def call(self, method, params, expected):
+        if method not in ('pane.list', 'pane.process_info'):
+            raise DetectorError('non-read-only API method refused')
+        deadline = min(self.deadline or float('inf'), time.monotonic() + 1.0)
+        info = os.lstat(self.path)
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise DetectorError('Herdr socket is not a same-UID Unix socket')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+            stream.settimeout(remaining(deadline))
+            stream.connect(self.path)
+            _, uid, _ = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid != os.getuid():
+                raise DetectorError('Herdr socket peer UID mismatch')
+            stream.settimeout(remaining(deadline))
+            stream.sendall(json.dumps({'id': 'bridge', 'method': method, 'params': params}).encode() + b'\n')
+            data = bytearray()
+            while b'\n' not in data:
+                stream.settimeout(remaining(deadline))
+                chunk = stream.recv(min(65536, MAX_API_BYTES + 1 - len(data)))
+                if not chunk:
+                    raise DetectorError('Herdr socket closed before response')
+                data.extend(chunk)
+                if len(data) > MAX_API_BYTES:
+                    raise DetectorError('Herdr response exceeds size limit')
+        try:
+            response = json.loads(data.split(b'\n', 1)[0])
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise DetectorError('invalid Herdr JSON response') from exc
+        if not isinstance(response, dict) or response.get('id') != 'bridge':
+            raise DetectorError('Herdr response ID mismatch')
+        if 'error' in response:
+            # Do not echo untrusted API diagnostics or terminal controls.
+            raise DetectorError('Herdr API returned an error for ' + method)
+        result = response.get('result')
+        if not isinstance(result, dict) or result.get('type') != expected:
+            raise DetectorError('unexpected Herdr result schema for ' + method)
+        return result
+
+
+def parse_tcp(text, family, uid):
+    """Map same-UID, exact-loopback LISTEN inodes to endpoints."""
+    found = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or fields[0] == 'sl':
+            continue
+        address, port_hex = fields[1].split(':')
+        if fields[3] != '0A' or int(fields[7]) != uid:
+            continue
+        raw = bytes.fromhex(address)
+        raw = b''.join(raw[i:i+4][::-1] if sys.byteorder == 'little' else raw[i:i+4]
+                       for i in range(0, len(raw), 4))
+        host = socket.inet_ntop(socket.AF_INET if family == 4 else socket.AF_INET6, raw)
+        port = int(port_hex, 16)
+        if host in ('127.0.0.1', '::1') and 1024 <= port <= 65535:
+            found[fields[9]] = (host, port)
+    return found
+
+
+def bounded_read(path, limit=1024*1024):
+    with open(path, 'rb') as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise DetectorError('proc data exceeds size limit')
+    return data.decode('utf-8', errors='strict')
+
+
+def label(value):
+    if not isinstance(value, str):
+        raise DetectorError('invalid Herdr label')
+    return ''.join(c for c in value if not unicodedata.category(c).startswith('C'))[:128].strip()
+
+
+class ProcTree:
+    """Walk only /proc/PID/task/TID/children beneath supplied foreground PIDs.
+
+    No /proc-wide process search. Verify UID, namespaces, parent and start time;
+    disappeared processes are normal, unreadable/malformed proc data is an error.
+    """
+    def __init__(self, root, deadline):
+        self.root = Path(root)
+        self.deadline = deadline
+        self.uid = os.getuid()
+        self.namespaces = {n: os.readlink(self.root / 'self' / 'ns' / n) for n in ('net', 'pid', 'mnt')}
+        self.visits = 0
+        self.entries = 0
+
+    def identity(self, pid):
+        base = self.root / str(pid)
+        try:
+            if base.stat().st_uid != self.uid:
+                return None
+            status = bounded_read(base / 'status')
+            uids = next((line.split()[1:] for line in status.splitlines() if line.startswith('Uid:')), [])
+            if len(uids) != 4:
+                raise DetectorError('invalid proc UID data')
+            if any(int(u) != self.uid for u in uids):
+                return None
+            if any(os.readlink(base / 'ns' / n) != target for n, target in self.namespaces.items()):
+                return None
+            cgroup = bounded_read(base / 'cgroup').lower()
+            if any(marker in cgroup for marker in ('docker', 'kubepods', 'libpod', 'containerd', 'lxc', 'machine.slice')):
+                return None
+            fields = bounded_read(base / 'stat').rsplit(')', 1)[1].split()
+            return (int(fields[1]), int(fields[19]))  # ppid, starttime
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+
+    def directory(self, path):
+        # Do not materialize an unbounded fd/task directory.
+        with os.scandir(path) as entries:
+            for entry in entries:
+                remaining(self.deadline)
+                self.entries += 1
+                if self.entries > 65536:
+                    raise DetectorError('proc entry budget exceeded')
+                yield Path(entry.path)
+
+    def endpoints(self, roots, listeners):
+        found = set()
+        seen = set()
+        pending = [(pid, None, ()) for pid in roots]
+        while pending:
+            remaining(self.deadline)
+            pid, parent, chain = pending.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            self.visits += 1
+            if self.visits > 4096:
+                raise DetectorError('process budget exceeded')
+            identity = self.identity(pid)
+            if identity is None or (parent is not None and identity[0] != parent):
+                continue
+            chain = chain + ((pid, identity),)
+            base = self.root / str(pid)
+            try:
+                endpoints = set()
+                for fd in self.directory(base / 'fd'):
+                    try:
+                        match = re.fullmatch(r'socket:\[(\d+)\]', os.readlink(fd))
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
+                    if match and match[1] in listeners:
+                        endpoints.add(listeners[match[1]])
+                children = set()
+                for task in self.directory(base / 'task'):
+                    try:
+                        children.update(int(p) for p in bounded_read(task / 'children', 65536).split())
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
+                # Recheck the complete lineage before attributing sockets or children.
+                if any(self.identity(p) != identity_before for p, identity_before in chain):
+                    continue
+                found.update(endpoints)
+                pending.extend((child, pid, chain) for child in children if child > 0)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return found
+
+
+def detect(client, proc_root='/proc', deadline=None):
+    deadline = deadline or time.monotonic() + 2.5
+    result = client.call('pane.list', {}, 'pane_list')
+    panes = result.get('panes')
+    if not isinstance(panes, list) or len(panes) > 256:
+        raise DetectorError('invalid or oversized pane list')
+    identities = set()
+    for pane in panes:
+        if not isinstance(pane, dict) or not isinstance(pane.get('pane_id'), str) or not pane['pane_id'] or len(pane['pane_id']) > 128:
+            raise DetectorError('invalid pane identity')
+        if pane['pane_id'] in identities:
+            raise DetectorError('duplicate pane identity')
+        identities.add(pane['pane_id'])
+    proc_root = Path(proc_root)
+    tree = ProcTree(proc_root, deadline)
+    listeners = parse_tcp(bounded_read(proc_root / 'net' / 'tcp', 8*1024*1024), 4, os.getuid())
+    try:
+        listeners.update(parse_tcp(bounded_read(proc_root / 'net' / 'tcp6', 8*1024*1024), 6, os.getuid()))
+    except FileNotFoundError:
+        pass  # IPv6 may be disabled in the kernel.
+    services, endpoints = [], set()
+    for pane in sorted(panes, key=lambda p: p['pane_id']):
+        remaining(deadline)
+        pane_id = pane['pane_id']
+        result = client.call('pane.process_info', {'pane_id': pane_id}, 'pane_process_info')
+        info = result.get('process_info')
+        if not isinstance(info, dict) or info.get('pane_id') != pane_id:
+            raise DetectorError('invalid pane process_info schema')
+        processes = info.get('foreground_processes', [])
+        if not isinstance(processes, list) or len(processes) > 4096:
+            raise DetectorError('invalid foreground process list')
+        roots = []
+        for process in processes:
+            if not isinstance(process, dict) or type(process.get('pid')) is not int or not 0 < process['pid'] <= 4294967295:
+                raise DetectorError('invalid foreground PID')
+            roots.append(process['pid'])
+        project = pane.get('foreground_cwd') or pane.get('cwd') or ''
+        if not isinstance(project, str):
+            raise DetectorError('invalid project label')
+        project = label(Path(project).name) or label(pane.get('label') or pane_id)
+        for host, port in sorted(tree.endpoints(roots, listeners)):
+            if (host, port) in endpoints:
+                continue
+            endpoints.add((host, port))
+            digest = hashlib.sha256(json.dumps([pane_id, host, port], ensure_ascii=True).encode()).hexdigest()
+            services.append({'id': 's-' + digest, 'pane': label(pane_id), 'project': project, 'host': host, 'port': port})
+            if len(services) > MAX_SERVICES:
+                raise DetectorError('service count exceeds limit')
+    return {'version': 1, 'type': 'snapshot', 'services': services}
+
+
+def encode_frame(frame):
+    if len(frame.get('services', [])) > MAX_SERVICES:
+        raise DetectorError('service count exceeds limit')
+    data = (json.dumps(frame, ensure_ascii=False, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
+    if len(data) > MAX_FRAME_BYTES:
+        raise DetectorError('snapshot exceeds frame size limit')
+    return data
+
+
+def error_frame(exc):
+    if isinstance(exc, DetectorError):
+        message = label(str(exc))
+    elif isinstance(exc, TimeoutError):
+        message = 'Herdr discovery timed out'
+    elif isinstance(exc, FileNotFoundError):
+        message = 'Herdr socket or required proc data unavailable'
+    elif isinstance(exc, PermissionError):
+        message = 'Herdr socket or proc permission denied'
+    elif isinstance(exc, OSError):
+        message = 'Herdr socket or proc I/O failed'
+    else:
+        message = 'Malformed Herdr or proc data'
+    return {'version': 1, 'type': 'error', 'message': message}
+
+
+def socket_path():
+    explicit = os.environ.get('HERDR_SOCKET_PATH')
+    if explicit:
+        return Path(explicit)
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'herdr'
+    session = os.environ.get('HERDR_SESSION')
+    if session:
+        if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}', session):
+            raise DetectorError('invalid HERDR_SESSION; use HERDR_SOCKET_PATH')
+        return config / 'sessions' / session / 'herdr.sock'
+    return config / 'herdr.sock'
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--once', action='store_true', help='emit one NDJSON snapshot (default)')
+    mode.add_argument('--watch', action='store_true', help='emit a full snapshot every 3 seconds')
+    args = parser.parse_args(argv)
+    while True:
+        started = time.monotonic()
+        try:
+            if not sys.platform.startswith('linux') or os.getuid() != os.geteuid():
+                raise DetectorError('Linux same-real/effective-UID execution required')
+            deadline = started + 2.5
+            frame = detect(HerdrClient(socket_path(), deadline), deadline=deadline)
+            data = encode_frame(frame)
+        except (DetectorError, OSError, ValueError, TypeError, KeyError, IndexError, RecursionError) as exc:
+            sys.stdout.buffer.write(encode_frame(error_frame(exc)))
+            sys.stdout.buffer.flush()
+            return 1
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+        if not args.watch:
+            return 0
+        time.sleep(max(0, 3.0 - (time.monotonic() - started)))
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)
