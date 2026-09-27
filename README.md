@@ -1,5 +1,9 @@
 # Herdr Bridge Agent
 
+[Download the Linux detector](https://github.com/realjesset/herdr-bridge-agent/releases/download/v0.1.0-alpha.1/herdr-bridge-agent) · [Alpha release and checksum](https://github.com/realjesset/herdr-bridge-agent/releases/tag/v0.1.0-alpha.1)
+
+GitHub Linux CI passed on Python 3.10 and 3.13. Install the downloaded script using the instructions below; no root or third-party Python packages are needed.
+
 **Security note:** Stop cancels new connections only; existing forwarded TCP/WebSocket sessions may remain until you Disconnect or quit the Mac app.
 
 **A small, read-only Linux detector for [Herdr Bridge for macOS](https://github.com/realjesset/herdr-bridge-macos).** Start a development server in Herdr on Linux; approve its SSH forward from your Mac's menu bar.
